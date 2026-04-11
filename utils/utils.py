@@ -548,33 +548,36 @@ def set_random_seed(seed):
     os.environ["PYTHONHASHSEED"] = str(seed)
 
 
+
 import numpy as np
 from collections import defaultdict
-from sklearn.cluster import SpectralClustering
-
 import torch
-import numpy as np
-from collections import defaultdict
-from sklearn.cluster import SpectralClustering
-# 推荐超参配置
-MIN_SPLIT_SIZE = 10          # 只有簇大小 >=10 才尝试分裂
-SPLIT_AM_THRESH = 0.5        # 只有 a_m >= 0.5 才分裂
+from sklearn.cluster import KMeans
 
-NUM_SUBCLUSTERS = 2          # 分裂时拆分成 2 个子簇
-MAX_SPLIT_CLIP = 0.5         # 分裂惩罚最大值
+# ================= 超参数 =================
+MIN_SPLIT_SIZE = 10
+SPLIT_AM_THRESH = 0.5
 
-MAX_MERGE_SIZE = 20          # 只有簇大小 <=20 才尝试合并
-MERGE_BM_THRESH = 0.4        # 只有 b_m <= 0.4 才合并
-MAX_MERGE_CLIP = 0.5         # 合并惩罚绝对值最大
+NUM_SUBCLUSTERS = 2
+MAX_SPLIT_CLIP = 0.5
+
+MAX_MERGE_SIZE = 20
+MERGE_BM_THRESH = 0.4
+MAX_MERGE_CLIP = 0.5
 
 EPS_DEFAULT = 0.5
-LAMBDA_DEFAULT = 0.5         # 缩小基底，减弱幂函数放大效应
-VOTE_RATIO = 0.7  #投票率，原来为写死的2/3
+LAMBDA_DEFAULT = 0.5
 
+VOTE_RATIO = 0.7
+
+
+# ================= Split Matrix =================
 def compute_split_matrix(features, pseudo_labels, eps=EPS_DEFAULT, lambda_=LAMBDA_DEFAULT):
     """
-    Compute split penalty matrix M_s with refined hyperparameters.
+    Compute split penalty matrix M_s using KMeans (stable version)
     """
+    split_count = 0
+    am_list = []
     N = features.shape[0]
     M_s = torch.zeros((N, N), device=features.device)
     unique_labels = [l for l in set(pseudo_labels) if l != -1]
@@ -582,97 +585,177 @@ def compute_split_matrix(features, pseudo_labels, eps=EPS_DEFAULT, lambda_=LAMBD
     for label in unique_labels:
         indices = [i for i, pl in enumerate(pseudo_labels) if pl == label]
         n_samples = len(indices)
+
+        # 小簇不拆
         if n_samples < MIN_SPLIT_SIZE:
             continue
 
         sub_feats = features[indices]
+
+        # ===== cluster compactness =====
         dist_mat = torch.cdist(sub_feats, sub_feats, p=2)
         a_x = (dist_mat.sum(dim=1) - torch.diag(dist_mat)) / (n_samples - 1)
         a_m = a_x.mean().item()
+
         if a_m < SPLIT_AM_THRESH:
             continue
-        print(f"[SPLIT] cluster={label}, n={n_samples}, a_m={a_m:.4f}")
 
-        # 仅拆 2 个子簇，避免过度分裂
+
+        # print(f"[SPLIT] cluster={label}, n={n_samples}, a_m={a_m:.4f}")
+        split_count += 1
+        am_list.append(a_m)
+
+
+        # ===== 自适应子簇数（可选增强）=====
         n_subs = NUM_SUBCLUSTERS
-        n_neighbors = min(10, n_samples - 1)
-        sub_feats_np = sub_feats.cpu().numpy().astype(np.float64)
-        spectral = SpectralClustering(
-            n_clusters=n_subs,
-            affinity='nearest_neighbors',
-            n_neighbors=n_neighbors,
-            assign_labels='kmeans'
-        )
+        # n_subs = 2 if a_m < 0.7 else 3   # 可选论文增强
+
+        sub_feats_np = sub_feats.detach().cpu().numpy().astype(np.float64)
+
+        # ===== KMeans替代Spectral =====
         try:
-            sub_labels = spectral.fit_predict(sub_feats_np)
+            kmeans = KMeans(
+                n_clusters=n_subs,
+                init='k-means++',
+                n_init=10,
+                max_iter=300,
+                random_state=0
+            )
+            sub_labels = kmeans.fit_predict(sub_feats_np)
+
+            # 防止无效分裂（非常关键）
+            if len(set(sub_labels)) < 2:
+                continue
+
         except Exception as e:
-            print(f"[SPLIT] spectral failed: {e}")
+            print(f"[SPLIT] kmeans failed: {e}")
             continue
+
+        # ===== 构建分裂惩罚矩阵 =====
+        val = (eps / lambda_) * (lambda_ ** a_m)
+        val = float(min(val, MAX_SPLIT_CLIP))
 
         for i_idx, i in enumerate(indices):
             for j_idx, j in enumerate(indices):
                 if i < j and sub_labels[i_idx] != sub_labels[j_idx]:
-                    val = (eps / lambda_) * (lambda_ ** a_m)
-                    val = float(min(val, MAX_SPLIT_CLIP))
                     M_s[i, j] = val
                     M_s[j, i] = val
-    return M_s
+
+    avg_am = float(np.mean(am_list)) if am_list else 0.0
+    return M_s, split_count, avg_am
 
 
+# ================= Merge Matrix =================
 def compute_merge_matrix(features, pseudo_labels, eps=EPS_DEFAULT, lambda_=LAMBDA_DEFAULT):
     """
-    Compute merge penalty matrix M_m with refined hyperparameters.
+    Compute merge penalty matrix M_m
     """
+    merge_count = 0
+    bm_list = []
     N = features.shape[0]
     M_m = torch.zeros((N, N), device=features.device)
+
     unique_labels = [l for l in set(pseudo_labels) if l != -1]
-    cluster_indices = {l: [i for i, pl in enumerate(pseudo_labels) if pl == l] for l in unique_labels}
+    cluster_indices = {
+        l: [i for i, pl in enumerate(pseudo_labels) if pl == l]
+        for l in unique_labels
+    }
+
     dist = torch.cdist(features, features, p=2)
 
     for label_m, idx_m in cluster_indices.items():
         n_samples = len(idx_m)
+
+        # 大簇不合并
         if n_samples == 0 or n_samples > MAX_MERGE_SIZE:
             continue
+
         b_x_list = []
         votes = defaultdict(int)
+
         for i in idx_m:
-            min_dist, nearest = float('inf'), None
+            min_dist = float('inf')
+            nearest = None
+
             for label_n, idx_n in cluster_indices.items():
-                if label_n == label_m or len(idx_n) == 0: continue
+                if label_n == label_m or len(idx_n) == 0:
+                    continue
+
                 avg_dist = float(dist[i, idx_n].mean())
+
                 if avg_dist < min_dist:
-                    min_dist, nearest = avg_dist, label_n
+                    min_dist = avg_dist
+                    nearest = label_n
+
             if nearest is not None:
                 b_x_list.append(min_dist)
                 votes[nearest] += 1
 
+        # ===== 投票决定 merge =====
         for cluster_p, cnt in votes.items():
             if cnt >= VOTE_RATIO * n_samples:
+
                 b_m = float(np.mean(b_x_list)) if b_x_list else 0.0
+
                 if b_m > MERGE_BM_THRESH:
                     break
-                print(f"[MERGE] {label_m}->{cluster_p}, n={n_samples}, b_m={b_m:.4f}")
+
+                # print(f"[MERGE] {label_m}->{cluster_p}, n={n_samples}, b_m={b_m:.4f}")
+                merge_count += 1
+                bm_list.append(b_m)
+
+
                 val = - (eps / lambda_) * (lambda_ ** (1 - b_m))
                 val = float(max(val, -MAX_MERGE_CLIP))
+
                 for i in idx_m:
                     for j in cluster_indices[cluster_p]:
                         M_m[i, j] = val
                         M_m[j, i] = val
                 break
-    return M_m
+
+    # return M_m
+    avg_bm = float(np.mean(bm_list)) if bm_list else 0.0
+    return M_m, merge_count, avg_bm
+
+# ================= Final Distance =================
+def generate_corrected_distance_matrix(
+        features,
+        pseudo_labels0,
+        base_dist,
+        eps=EPS_DEFAULT,
+        lambda_=LAMBDA_DEFAULT
+):
+    """
+    Final corrected distance matrix:
+    D = base_dist + M_s + M_m
+    """
+
+    # M_s = compute_split_matrix(features, pseudo_labels0, eps, lambda_)
+    # M_m = compute_merge_matrix(features, pseudo_labels0, eps, lambda_)
+
+    M_s, split_cnt, avg_am = compute_split_matrix(features, pseudo_labels0, eps, lambda_)
+    M_m, merge_cnt, avg_bm = compute_merge_matrix(features, pseudo_labels0, eps, lambda_)
 
 
-def generate_corrected_distance_matrix(features, pseudo_labels0, base_dist, eps=EPS_DEFAULT, lambda_=LAMBDA_DEFAULT):
-    M_s = compute_split_matrix(features, pseudo_labels0, eps, lambda_)
-    M_m = compute_merge_matrix(features, pseudo_labels0, eps, lambda_)
     if isinstance(base_dist, torch.Tensor):
         base_dist = base_dist.cpu().numpy()
+
     M_s = M_s.cpu().numpy()
     M_m = M_m.cpu().numpy()
-    corrected = base_dist + M_s + M_m
-    corrected = 0.5 * (corrected + corrected.T)
-    np.fill_diagonal(corrected, 0.0)
-    corrected = np.clip(corrected, 0.0, None)
-    print(f"[CORRECTED] min={corrected.min():.4f}, max={corrected.max():.4f}")
-    return corrected
 
+    corrected = base_dist + M_s + M_m
+
+    # 对称化
+    corrected = 0.5 * (corrected + corrected.T)
+
+    # 对角归零
+    np.fill_diagonal(corrected, 0.0)
+
+    # 防止负数
+    corrected = np.clip(corrected, 0.0, None)
+
+    # print(f"[CORRECTED] min={corrected.min():.4f}, max={corrected.max():.4f}")
+
+    # return corrected
+    return corrected, split_cnt, merge_cnt, avg_am, avg_bma
