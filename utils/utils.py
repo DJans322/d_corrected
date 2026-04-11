@@ -561,14 +561,14 @@ SPLIT_AM_THRESH = 0.5
 NUM_SUBCLUSTERS = 2
 MAX_SPLIT_CLIP = 0.5
 
-MAX_MERGE_SIZE = 20
-MERGE_BM_THRESH = 0.4
-MAX_MERGE_CLIP = 0.5
+MAX_MERGE_SIZE = 50  # 放宽合并大小限制，允许更多簇参与合并
+MERGE_BM_THRESH = 0.6  # 提高阈值，更容易触发合并
+MAX_MERGE_CLIP = 1.0  # 增强合并惩罚强度
 
 EPS_DEFAULT = 0.5
 LAMBDA_DEFAULT = 0.5
 
-VOTE_RATIO = 0.7
+VOTE_RATIO = 0.5  # 降低投票比例，从 70% 降至 50%，更容易触发合并
 
 
 # ================= Split Matrix =================
@@ -593,9 +593,8 @@ def compute_split_matrix(features, pseudo_labels, eps=EPS_DEFAULT, lambda_=LAMBD
         sub_feats = features[indices]
 
         # ===== cluster compactness =====
-        dist_mat = torch.cdist(sub_feats, sub_feats, p=2)
-        a_x = (dist_mat.sum(dim=1) - torch.diag(dist_mat)) / (n_samples - 1)
-        a_m = a_x.mean().item()
+        cluster_center = sub_feats.mean(dim=0, keepdim=True)
+        a_m = torch.cdist(sub_feats, cluster_center).mean().item()
 
         if a_m < SPLIT_AM_THRESH:
             continue
@@ -648,7 +647,7 @@ def compute_split_matrix(features, pseudo_labels, eps=EPS_DEFAULT, lambda_=LAMBD
 # ================= Merge Matrix =================
 def compute_merge_matrix(features, pseudo_labels, eps=EPS_DEFAULT, lambda_=LAMBDA_DEFAULT):
     """
-    Compute merge penalty matrix M_m
+    Compute merge penalty matrix M_m with improved merging strategy
     """
     merge_count = 0
     bm_list = []
@@ -661,9 +660,19 @@ def compute_merge_matrix(features, pseudo_labels, eps=EPS_DEFAULT, lambda_=LAMBD
         for l in unique_labels
     }
 
-    dist = torch.cdist(features, features, p=2)
+    # 计算簇心
+    cluster_centers = {}
+    for label, indices in cluster_indices.items():
+        cluster_centers[label] = features[indices].mean(0)
 
-    for label_m, idx_m in cluster_indices.items():
+    dist = torch.cdist(features, features, p=2)
+    center_dist = torch.cdist(
+        torch.stack(list(cluster_centers.values())),
+        torch.stack(list(cluster_centers.values())),
+        p=2
+    )
+
+    for idx_m_label, (label_m, idx_m) in enumerate(cluster_indices.items()):
         n_samples = len(idx_m)
 
         # 大簇不合并
@@ -674,38 +683,50 @@ def compute_merge_matrix(features, pseudo_labels, eps=EPS_DEFAULT, lambda_=LAMBD
         votes = defaultdict(int)
 
         for i in idx_m:
-            min_dist = float('inf')
-            nearest = None
-
+            dist_list = []
+            label_list = []
+            
             for label_n, idx_n in cluster_indices.items():
                 if label_n == label_m or len(idx_n) == 0:
                     continue
-
+                
                 avg_dist = float(dist[i, idx_n].mean())
-
-                if avg_dist < min_dist:
-                    min_dist = avg_dist
-                    nearest = label_n
-
-            if nearest is not None:
-                b_x_list.append(min_dist)
-                votes[nearest] += 1
+                dist_list.append(avg_dist)
+                label_list.append(label_n)
+            
+            if len(dist_list) >= 2:
+                # 排序找到最近和次近的簇
+                sorted_indices = np.argsort(dist_list)
+                nearest_dist = dist_list[sorted_indices[0]]
+                second_nearest_dist = dist_list[sorted_indices[1]]
+                nearest_label = label_list[sorted_indices[0]]
+                
+                # 使用相对距离作为指标（最近/次近的比值）
+                relative_dist = nearest_dist / (second_nearest_dist + 1e-8)
+                b_x_list.append(relative_dist)
+                votes[nearest_label] += 1
+            elif len(dist_list) == 1:
+                # 只有一个其他簇的特殊情况
+                b_x_list.append(dist_list[0])
+                votes[label_list[0]] += 1
 
         # ===== 投票决定 merge =====
         for cluster_p, cnt in votes.items():
-            if cnt >= VOTE_RATIO * n_samples:
-
+            vote_score = cnt / n_samples  # 投票比例
+            
+            if vote_score >= VOTE_RATIO:
                 b_m = float(np.mean(b_x_list)) if b_x_list else 0.0
 
+                # 改进：降低距离阈值，允许距离稍远但投票强烈的簇合并
                 if b_m > MERGE_BM_THRESH:
                     break
 
-                # print(f"[MERGE] {label_m}->{cluster_p}, n={n_samples}, b_m={b_m:.4f}")
+                # print(f"[MERGE] {label_m}->{cluster_p}, n={n_samples}, b_m={b_m:.4f}, vote={vote_score:.2f}")
                 merge_count += 1
                 bm_list.append(b_m)
 
-
-                val = - (eps / lambda_) * (lambda_ ** (1 - b_m))
+                # 改进：使用距离的倒数强化，负值更强
+                val = - (eps / lambda_) * (lambda_ ** (1 - b_m)) * (1 + vote_score)
                 val = float(max(val, -MAX_MERGE_CLIP))
 
                 for i in idx_m:
@@ -737,7 +758,6 @@ def generate_corrected_distance_matrix(
     M_s, split_cnt, avg_am = compute_split_matrix(features, pseudo_labels0, eps, lambda_)
     M_m, merge_cnt, avg_bm = compute_merge_matrix(features, pseudo_labels0, eps, lambda_)
 
-
     if isinstance(base_dist, torch.Tensor):
         base_dist = base_dist.cpu().numpy()
 
@@ -755,7 +775,13 @@ def generate_corrected_distance_matrix(
     # 防止负数
     corrected = np.clip(corrected, 0.0, None)
 
+    # 调试信息：分别统计两个分支的影响
+    split_contribution = np.abs(M_s).sum()
+    merge_contribution = np.abs(M_m).sum()
+    
     # print(f"[CORRECTED] min={corrected.min():.4f}, max={corrected.max():.4f}")
+    # print(f"[CONTRIBUTION] Split={split_contribution:.4f}, Merge={merge_contribution:.4f}")
+    # print(f"[STATS] split_cnt={split_cnt}, merge_cnt={merge_cnt}, avg_am={avg_am:.4f}, avg_bm={avg_bm:.4f}")
 
     # return corrected
-    return corrected, split_cnt, merge_cnt, avg_am, avg_bm
+    return corrected, split_cnt, merge_cnt, avg_am, avg_bm, split_contribution, merge_contribution
