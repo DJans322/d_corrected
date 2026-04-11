@@ -758,4 +758,4 @@ def generate_corrected_distance_matrix(
     # print(f"[CORRECTED] min={corrected.min():.4f}, max={corrected.max():.4f}")
 
     # return corrected
-    return corrected, split_cnt, merge_cnt, avg_am, avg_bma
+    return corrected, split_cnt, merge_cnt, avg_am, avg_bm
