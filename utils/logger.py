@@ -70,14 +70,16 @@ class TrainingLogger:
             "min_cluster_size": int(np.min(cluster_sizes)) if cluster_sizes else 0,
         })
 
-    def log_split_merge(self, epoch, split_cnt, merge_cnt, avg_am=None, avg_bm=None):
+    def log_split_merge(self, epoch, split_cnt, merge_cnt, avg_am=None, avg_bm=None, split_contribution=None, merge_contribution=None):
         self.log({
             "type": "split_merge",
             "epoch": epoch,
             "split_clusters": split_cnt,
             "merge_clusters": merge_cnt,
             "avg_a_m": avg_am,
-            "avg_b_m": avg_bm
+            "avg_b_m": avg_bm,
+            "split_contribution": split_contribution,
+            "merge_contribution": merge_contribution
         })
 
     def log_eval(self, epoch, mAP=None, top1=None):

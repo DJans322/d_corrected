@@ -166,8 +166,8 @@ def main(args):
             # Calculate distance
             base_dist = compute_jaccard_distance(target_features, k1=30, k2=6, search_option=3, use_float16=True)
             pseudo_labels0 = cluster.fit_predict(base_dist.copy())
-            corrected_dist,split_cnt, merge_cnt, avg_am, avg_bm = generate_corrected_distance_matrix(target_features,pseudo_labels0,base_dist,eps=0.5,lambda_=1.0)
-            logger.log_split_merge(epoch, split_cnt, merge_cnt, avg_am, avg_bm) #修正矩阵记录
+            corrected_dist,split_cnt, merge_cnt, avg_am, avg_bm, split_contribution, merge_contribution = generate_corrected_distance_matrix(target_features,pseudo_labels0,base_dist,eps=0.5,lambda_=1.0)
+            logger.log_split_merge(epoch, split_cnt, merge_cnt, avg_am, avg_bm, split_contribution, merge_contribution) #修正矩阵记录
             pseudo_labels = cluster.fit_predict(corrected_dist)
             logger.log_cluster(epoch, pseudo_labels)  #修正矩阵记录
             
