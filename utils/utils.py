@@ -776,8 +776,8 @@ def generate_corrected_distance_matrix(
     corrected = np.clip(corrected, 0.0, None)
 
     # 调试信息：分别统计两个分支的影响
-    split_contribution = np.abs(M_s).sum()
-    merge_contribution = np.abs(M_m).sum()
+    split_contribution = float(np.abs(M_s).sum())
+    merge_contribution = float(np.abs(M_m).sum())
     
     # print(f"[CORRECTED] min={corrected.min():.4f}, max={corrected.max():.4f}")
     # print(f"[CONTRIBUTION] Split={split_contribution:.4f}, Merge={merge_contribution:.4f}")
